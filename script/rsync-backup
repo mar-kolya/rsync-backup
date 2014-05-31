@@ -1,0 +1,313 @@
+#!/usr/bin/perl
+
+use v5.10;
+use strict;
+use warnings;
+
+use DateTime;
+use DateTime::Duration;
+use DateTime::Format::Duration;
+use DateTime::Format::Strptime;
+use Time::HiRes qw(time);
+use Path::Class qw(dir file);
+use File::stat;
+use IPC::Run qw(run);
+use Try::Tiny;
+use List::Util qw(any);
+use Scalar::Util qw(blessed);
+use Config::YAML;
+use Getopt::Long;
+
+my %options = (
+    config => ''.file($0)->absolute->dir->parent->file('etc', 'rsync-backup.yaml'),
+    list => 0,
+    backup => 0,
+    expire => 0,
+    force => 0,
+    'dry-run' => 0,
+    now => undef
+);
+GetOptions(\%options, 'config=s', 'force!', 'backup!', 'list!', 'expire!', 'dry-run!', 'now=s');
+
+my $config = Config::YAML->new(
+    config => $options{config},
+    root => '/mnt/backup',
+    mv_cmd => '/bin/mv',
+    rm_cmd => '/bin/rm',
+    rsync_cmd => '/usr/bin/rsync',
+    rsync_opts => [qw(-a -H -A -X -x --delete --delete-excluded -v --human-readable)],
+    rsync_filters => [
+	'- /**/lost+found',
+	'- /lost+found',
+	'- #*#',
+	'- .#*',
+	'- *.tmp',
+	'- *~'
+       ],
+   );
+my $default_expire = {
+    'all' => '7 days',
+    'daily' => '14 days',
+    'weekly' => '6 months',
+    'monthly' => 'forever'
+};
+my $default_min_snapshots = 2;
+
+my $snapshot_name_format = '%Y%m%d-%H%M%S-%3N';
+my $snapshot_name_parser = DateTime::Format::Strptime->new(
+    pattern => $snapshot_name_format,
+    time_zone => 'local'
+   );
+
+my $now = DateTime->from_epoch(epoch => time());
+if($options{now}) {
+    $now = $snapshot_name_parser->parse_datetime($options{now});
+    die "Cannot parse now, please use '$snapshot_name_format' format" unless($now);
+}
+my $local_now = $now->clone->set_time_zone('local');
+my $now_snapshot_name = $local_now->strftime($snapshot_name_format);
+
+unless(-d $config->{root}) {
+    die "backup root not found";
+}
+
+my @interval_formats = (
+    DateTime::Format::Duration->new(pattern => '%m months'),
+    DateTime::Format::Duration->new(pattern => '%m month'),
+    DateTime::Format::Duration->new(pattern => '%e days'),
+    DateTime::Format::Duration->new(pattern => '%e day'),
+    DateTime::Format::Duration->new(pattern => '%ed'),
+    DateTime::Format::Duration->new(pattern => '%H hours'),
+    DateTime::Format::Duration->new(pattern => '%H hour'),
+    DateTime::Format::Duration->new(pattern => '%Hh'),
+    DateTime::Format::Duration->new(pattern => '%M minutes'),
+    DateTime::Format::Duration->new(pattern => '%M minute')
+   );
+
+if ($options{list}) {
+    while(my ($backup_name, $backup) = each(%{$config->{backups}})) {
+	my $backup_dir = dir($config->{root}, ($backup->{backup_dir} || $backup_name));
+	my $snapshots = load_snapshots($backup_dir);
+
+	say "Snapshots for '$backup_name':";
+	foreach (@$snapshots) {
+	    say "  $_->{dir}";
+	}
+    }
+}
+
+if ($options{backup}) {
+    while(my ($backup_name, $backup) = each(%{$config->{backups}})) {
+	my $backup_dir = dir($config->{root}, ($backup->{backup_dir} || $backup_name));
+	my $current_dir = $backup_dir->subdir('current');
+	my $snapshot_dir = $backup_dir->subdir($now_snapshot_name);
+	my $log_dir = $backup_dir->subdir('log');
+	my $last = $backup_dir->file('last');
+
+	unless(-d $backup_dir) {
+	    $backup_dir->mkpath();
+	}
+
+	my $snapshots = load_snapshots($backup_dir);
+	my $last_dir = $snapshots->[-1]->{dir};
+
+	$log_dir->mkpath();
+	my $log_file = $log_dir->file($now_snapshot_name.'.log');
+
+	say "Backing up '$backup_name':";
+	say "  current dir: $current_dir";
+	say "  last dir: ".($last_dir ? $last_dir : "<none>");
+	say "  snapshot dir: $snapshot_dir";
+	say "  log file: $log_file";
+
+	my $interval;
+	foreach (@interval_formats) {
+	    $interval = $_->parse_duration($backup->{age});
+	    last if($interval->is_positive);
+	}
+	unless($interval->is_positive) {
+	    $interval = DateTime::Duration->new(days => 1);
+	    say "Cannot parse backup interval, using default: 1 day";
+	}
+
+	if(-e $last && stat($last)->mtime() > ($now - $interval)->epoch()) {
+	    if($options{force}) {
+		say "Backup is recent but we are forced to backup anyway";
+	    } else {
+		say "Backup is recent, skipping";
+		next;
+	    }
+	}
+
+	notify("Starting '$backup_name'");
+	my $log;
+	try {
+	    $log = $log_file->opena();
+	} catch {
+	    notify("Cannot open backup log for '$backup_name': $_", 'error');
+	    die $_;
+	};
+
+	try {
+	    my $start_time = DateTime->now();
+	    local *STDOUT;
+	    local *STDERR;
+	    open(STDOUT, '>&', $log) || die "Cannot redirect STDOUT: $!";
+	    open(STDERR, '>&', $log) || die "Cannot redirect STDERR: $!";
+
+	    die "Backup root not specified" unless($backup->{root});
+
+	    unless ($options{'dry-run'}) {
+		run([$config->{rsync_cmd},
+		     @{$config->{rsync_opts}},
+		     map({ ('-f', $_) } @{$config->{rsync_filters}}, @{$backup->{filters} || []}),
+		     ($last_dir ? ('--link-dest', $last_dir) : ()),
+		     $backup->{root}, $current_dir], '>&', $log) or die "rsync error: $?";
+
+		run([$config->{mv_cmd}, $current_dir, $snapshot_dir], '>&', $log) or die "move error: $?";
+
+		$last->touch();
+	    }
+
+	    my $end_time = DateTime->now();
+	    my $elapsed = DateTime::Format::Duration->new(pattern => '%Hh%Mm%Ss')
+		->format_duration(($end_time - $start_time)->clock_duration);
+	    notify("Completed '$backup_name', took: ".$elapsed);
+	    say $log "Completed, took: ".$elapsed;
+	} catch {
+	    notify("Error '$backup_name': $_", 'error');
+	    say $log "Error: $_";
+	};
+	$log->close();
+    }
+}
+
+if ($options{expire}) {
+    my @expire_types = (
+	{ key => 'all' },
+	{ key => 'daily', truncate => 'day', subtract => { days => 1 } },
+	{ key => 'weekly', truncate => 'week', subtract => { weeks => 1 } },
+	{ key => 'monthly', truncate => 'month', subtract => { months => 1 } });
+
+    while(my ($backup_name, $backup) = each(%{$config->{backups}})) {
+	my $backup_dir = dir($config->{root}, ($backup->{backup_dir} || $backup_name));
+	my $snapshots = load_snapshots($backup_dir);
+	my $expire_config = $backup->{expire} || $default_expire;
+	my $min_snapshots = $backup->{min_snapshots} || $default_min_snapshots;
+
+	if(0 + @$snapshots <= $min_snapshots) {
+	    say "Not enough snapshots to expire in '$backup_name'";
+	    next;
+	}
+	foreach (1 .. $min_snapshots) {
+	    $snapshots->[-$_]->{save} = 1;
+	}
+
+	my %expire;
+	while(my ($name, $duration) = each(%$expire_config)) {
+	    unless (any { $name eq $_->{key} } @expire_types) {
+		say "Warning: unknown expiration key: $name, skipping";
+		next;
+	    }
+	    if ($duration eq 'forever') {
+		# nothing to do, leave as is
+	    } else {
+		foreach (@interval_formats) {
+		    my $parsed = $_->parse_duration($duration);
+		    if($parsed->is_positive) {
+			$duration = $parsed;
+			last;
+		    }
+		}
+		unless (blessed($duration)) {
+		    say "Warning: cannot parse expiration interval for $name: $duration, skipping";
+		    next;
+		}
+	    }
+	    $expire{$name} = $duration;
+	}
+
+	foreach my $expire_type (@expire_types) {
+	    my $key = $expire_type->{key};
+	    my $duration = $expire{$key};
+	    next unless $duration;
+	    if ($key eq 'all') {
+		if (''.$duration ne 'forever') {
+		    my $from_date = $local_now->clone->subtract_duration($expire{$key});
+		    foreach (@$snapshots) {
+			$_->{save} = 1 if($_->{date} > $from_date);
+		    }
+		}
+	    } else {
+		my $to_date = $local_now->clone->truncate(to => $expire_type->{truncate});
+		my $end_date = ''.$duration eq 'forever' ? $snapshots->[0]->{date}
+		    : $to_date->clone->subtract_duration($duration);
+		my @snapshots = grep { $_->{date} >= $end_date } @$snapshots;
+		while($end_date <= $to_date) {
+		    my $from_date = $to_date->clone->subtract(%{$expire_type->{subtract}});
+		    my @current = grep {$_->{date} > $from_date && $_->{date} <= $to_date} @snapshots;
+		    $current[-1]->{save} = 1 if(@current);
+		    $to_date = $from_date;
+		}
+	    }
+	}
+
+	if ($options{'dry-run'}) {
+	    say "Snapshots to remove for '$backup_name':";
+	    foreach (@$snapshots) {
+		say "  $_->{dir}" unless $_->{save};
+	    }
+	} else {
+	    foreach (@$snapshots) {
+		next if $_->{save};
+		notify("Removing '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
+		try {
+		    my $start_time = DateTime->now();
+		    run([$config->{rm_cmd}, '-r', '-f', $_->{dir}]) or die "remove error: $?";
+		    my $end_time = DateTime->now();
+		    my $elapsed = DateTime::Format::Duration->new(pattern => '%Hh%Mm%Ss')
+			->format_duration(($end_time - $start_time)->clock_duration);
+		    notify("Done removing '$backup_name/"
+			   .$_->{date}->strftime($snapshot_name_format)."', took: ".$elapsed);
+		} catch {
+		    notify("Error '$backup_name': $_", 'error');
+		}
+	    }
+	}
+    }
+}
+
+sub load_snapshots {
+    my ($backup_dir) = @_;
+    my @snapshots;
+    while (my $file = $backup_dir->next) {
+	next unless($file->is_dir);
+	my $date = $snapshot_name_parser->parse_datetime($file);
+	next unless($date);
+	push(@snapshots, {date => $date, dir => $file});
+    }
+    @snapshots = sort { $a->{date} cmp $b->{date} } @snapshots;
+    return \@snapshots;
+}
+
+sub notify {
+    my ($message, $level) = @_;
+    say $message;
+    my $header = 'Backup';
+    $level ||= 'info';
+    $header = quotemeta($header);
+    $message = quotemeta($message);
+    $level = quotemeta($level);
+    run(['who'], '>', sub {
+	    my %seen;
+	    while($_[0] =~ /^(\w+)\s+.*?(?:\(\:(\d+)(?:\.\d+)?\))$/mg) {
+		my ($user, $display) = ($1, $2);
+		next if($seen{$user}->{$display});
+		$seen{$user}->{$display} = 1;
+		run(['sudo', '-u', $user, 'bash', '-c',
+		     qq{DISPLAY=:$display notify-send -i "$level" "$header" "$message"}]);
+	    }
+	});
+}
+
+
