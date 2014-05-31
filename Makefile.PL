@@ -16,6 +16,7 @@ requires 'IPC::Run';
 requires 'Try::Tiny';
 requires 'Config::YAML';
 requires 'Getopt::Long';
+requires 'Pod::Usage';
 
 install_script 'rsync-backup';
 

@@ -17,9 +17,11 @@ use List::Util qw(any);
 use Scalar::Util qw(blessed);
 use Config::YAML;
 use Getopt::Long;
+use Pod::Usage;
 
 my %options = (
     config => ''.file($0)->absolute->dir->parent->file('etc', 'rsync-backup.yaml'),
+    help => 0,
     list => 0,
     backup => 0,
     expire => 0,
@@ -27,7 +29,14 @@ my %options = (
     'dry-run' => 0,
     now => undef
 );
-GetOptions(\%options, 'config=s', 'force!', 'backup!', 'list!', 'expire!', 'dry-run!', 'now=s');
+GetOptions(\%options, 'config=s', 'help!', 'backup!', 'list!', 'expire!', 'dry-run!', 'force!', 'now=s')
+    or pod2usage;
+if ($options{help}) {
+    pod2usage(-verbose => 2);
+}
+unless (grep $_, @options{qw(backup list expire)}) {
+    pod2usage('No operation specified');
+}
 
 my $config = Config::YAML->new(
     config => $options{config},
@@ -310,4 +319,62 @@ sub notify {
 	});
 }
 
+__END__
 
+=head1 NAME
+
+rsync-backup - Simple script that maintains your backups using rsync.
+
+=head1 SYNOPSIS
+
+rsync-backup [--config=config] --backup [--force] [--dry-run] [--now=date]
+
+rsync-backup [--config=config] --list
+
+rsync-backup [--config=config] --expire [--dry-run] [--now=date]
+
+rsync-backup --help
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--help>
+
+Prints a brief help message and exits.
+
+=item B<--config>
+
+Specifies config file for you backup configuration.
+
+=item B<--backup>
+
+Runs backup opration.
+
+=item B<--expire>
+
+Expires (deletes) old backups.
+
+=item B<--list>
+
+Lists existing backups.
+
+=item B<--force>
+
+Forces backup even if existing backup is not old enough.
+
+=item B<--dry-run>
+
+No real backup or removal would happen.
+
+=item B<--now>
+
+Forces given date on a script. Useful when convering backups from other systems
+
+=back
+
+=head1 DESCRIPTION
+
+This program maintains backups of your system using rsync.
+
+=cut
