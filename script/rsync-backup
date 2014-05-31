@@ -18,6 +18,7 @@ use Scalar::Util qw(blessed);
 use Config::YAML;
 use Getopt::Long;
 use Pod::Usage;
+use Fcntl qw(:flock);
 
 my %options = (
     config => ''.file($0)->absolute->dir->parent->file('etc', 'rsync-backup.yaml'),
@@ -41,6 +42,7 @@ unless (grep $_, @options{qw(backup list expire)}) {
 my $config = Config::YAML->new(
     config => $options{config},
     root => '/mnt/backup',
+    lock => '/run/rsync-backup.lock',
     mv_cmd => '/bin/mv',
     rm_cmd => '/bin/rm',
     rsync_cmd => '/usr/bin/rsync',
@@ -106,6 +108,8 @@ if ($options{list}) {
 }
 
 if ($options{backup}) {
+    my $lock_fh = lock_file();
+
     while(my ($backup_name, $backup) = each(%{$config->{backups}})) {
 	my $backup_dir = dir($config->{root}, ($backup->{backup_dir} || $backup_name));
 	my $current_dir = $backup_dir->subdir('current');
@@ -187,11 +191,14 @@ if ($options{backup}) {
 	    notify("Error '$backup_name': $_", 'error');
 	    say $log "Error: $_";
 	};
-	$log->close();
+	$log->close;
     }
+    $lock_fh->close;
 }
 
 if ($options{expire}) {
+    my $lock_fh = lock_file();
+
     my @expire_types = (
 	{ key => 'all' },
 	{ key => 'daily', truncate => 'day', subtract => { days => 1 } },
@@ -284,6 +291,16 @@ if ($options{expire}) {
 	    }
 	}
     }
+
+    $lock_fh->close;
+}
+
+sub lock_file {
+    my $lock_fh = file($config->{lock})->openw() or die "Can't write to $config->{lock} $!";
+    flock($lock_fh, LOCK_EX | LOCK_NB) or die "Can't not lock '$config->{lock}' - $!";
+    truncate($lock_fh, 0);
+    say $lock_fh $$;
+    return $lock_fh;
 }
 
 sub load_snapshots {
