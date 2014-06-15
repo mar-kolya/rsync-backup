@@ -122,7 +122,7 @@ if ($options{backup}) {
 	}
 
 	my $snapshots = load_snapshots($backup_dir);
-	my $last_dir = $snapshots->[-1]->{dir};
+	my $last_dir = $snapshots->[-1]->{dir} if(@$snapshots);
 
 	$log_dir->mkpath();
 	my $log_file = $log_dir->file($now_snapshot_name.'.log');
