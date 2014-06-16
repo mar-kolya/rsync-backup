@@ -17,6 +17,7 @@ requires 'Try::Tiny';
 requires 'Config::YAML';
 requires 'Getopt::Long';
 requires 'Pod::Usage';
+requires 'Net::SFTP::Foreign';
 
 install_script 'rsync-backup';
 

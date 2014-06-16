@@ -18,7 +18,8 @@ use Scalar::Util qw(blessed);
 use Config::YAML;
 use Getopt::Long;
 use Pod::Usage;
-use Fcntl qw(:flock);
+use Net::SFTP::Foreign;
+use Fcntl qw(:flock S_ISDIR);
 
 my %options = (
     config => ''.file($0)->absolute->dir->parent->file('etc', 'rsync-backup.yaml'),
@@ -41,12 +42,16 @@ unless (grep $_, @options{qw(backup list expire)}) {
 
 my $config = Config::YAML->new(
     config => $options{config},
+    host => undef,
     root => '/mnt/backup',
     lock => '/run/rsync-backup.lock',
+    ssh_cmd => '/usr/bin/ssh',
+    ssh_opts => [qw()],
     mv_cmd => '/bin/mv',
     rm_cmd => '/bin/rm',
     rsync_cmd => '/usr/bin/rsync',
     rsync_opts => [qw(-a -H -A -X -x --delete --delete-excluded -v --human-readable)],
+    rsync_fake_super => 'auto',
     rsync_filters => [
 	'- /**/lost+found',
 	'- /lost+found',
@@ -78,10 +83,6 @@ if($options{now}) {
 my $local_now = $now->clone->set_time_zone('local');
 my $now_snapshot_name = $local_now->strftime($snapshot_name_format);
 
-unless(-d $config->{root}) {
-    die "backup root not found";
-}
-
 my @interval_formats = (
     DateTime::Format::Duration->new(pattern => '%m months'),
     DateTime::Format::Duration->new(pattern => '%m month'),
@@ -94,6 +95,32 @@ my @interval_formats = (
     DateTime::Format::Duration->new(pattern => '%M minutes'),
     DateTime::Format::Duration->new(pattern => '%M minute')
    );
+
+my $sftp;
+my @ssh_cmd;
+if ($config->{host}) {
+    @ssh_cmd = ($config->{ssh_cmd}, @{$config->{ssh_opts}}, $config->{host});
+    my @rsync_ssh_cmd = ('--rsh', join(' ', ($config->{ssh_cmd}, @{$config->{ssh_opts}})));
+    push(@{$config->{rsync_opts}}, @rsync_ssh_cmd);
+
+    $sftp = Net::SFTP::Foreign->new(host => $config->{host},
+				    ssh_cmd => $config->{ssh_cmd},
+				    more => $config->{ssh_opts});
+}
+if ($config->{rsync_fake_super} eq 'force' || ($config->{host} && $config->{rsync_fake_super} eq 'auto')) {
+    push(@{$config->{rsync_opts}}, '-M', '--fake-super');
+}
+
+if ($sftp) {
+    my $stat = $sftp->stat($config->{root});
+    unless ($stat && S_ISDIR($stat->perm)) {
+	die "backup root not found";
+    }
+} else {
+    unless(-d $config->{root}) {
+	die "backup root not found";
+    }
+}
 
 if ($options{list}) {
     while(my ($backup_name, $backup) = each(%{$config->{backups}})) {
@@ -117,15 +144,26 @@ if ($options{backup}) {
 	my $log_dir = $backup_dir->subdir('log');
 	my $last = $backup_dir->file('last');
 
-	unless(-d $backup_dir) {
-	    $backup_dir->mkpath();
+	if ($sftp) {
+	    $sftp->mkpath($backup_dir);
+	} else {
+	    unless(-d $backup_dir) {
+		$backup_dir->mkpath();
+	    }
 	}
 
 	my $snapshots = load_snapshots($backup_dir);
 	my $last_dir = $snapshots->[-1]->{dir} if(@$snapshots);
 
-	$log_dir->mkpath();
 	my $log_file = $log_dir->file($now_snapshot_name.'.log');
+	my $tmp_log_file;
+	if ($sftp) {
+	    $sftp->mkpath($log_dir);
+	    $tmp_log_file = Path::Class::tempdir(CLEANUP => 1)->file($now_snapshot_name.'.log');
+	} else {
+	    $log_dir->mkpath();
+	    $tmp_log_file = $log_file;
+	}
 
 	say "Backing up '$backup_name':";
 	say "  current dir: $current_dir";
@@ -143,7 +181,19 @@ if ($options{backup}) {
 	    say "Cannot parse backup interval, using default: 1 day";
 	}
 
-	if(-e $last && stat($last)->mtime() > ($now - $interval)->epoch()) {
+	my $too_old;
+	if ($sftp) {
+	    my $stat = $sftp->stat($last);
+	    unless ($stat && $stat->mtime() > ($now - $interval)->epoch()) {
+		$too_old = 1;
+	    }
+	} else {
+	    if(-e $last && stat($last)->mtime() > ($now - $interval)->epoch()) {
+		$too_old = 1;
+	    }
+	}
+
+	unless ($too_old) {
 	    if($options{force}) {
 		say "Backup is recent but we are forced to backup anyway";
 	    } else {
@@ -152,10 +202,11 @@ if ($options{backup}) {
 	    }
 	}
 
+
 	notify("Starting '$backup_name'");
 	my $log;
 	try {
-	    $log = $log_file->opena();
+	    $log = $tmp_log_file->opena();
 	} catch {
 	    notify("Cannot open backup log for '$backup_name': $_", 'error');
 	    die $_;
@@ -170,16 +221,25 @@ if ($options{backup}) {
 
 	    die "Backup root not specified" unless($backup->{root});
 
-	    unless ($options{'dry-run'}) {
-		run([$config->{rsync_cmd},
-		     @{$config->{rsync_opts}},
-		     map({ ('-f', $_) } @{$config->{rsync_filters}}, @{$backup->{filters} || []}),
-		     ($last_dir ? ('--link-dest', $last_dir) : ()),
-		     $backup->{root}, $current_dir], '>&', $log) or die "rsync error: $?";
+	    my @rsync_cmd = ($config->{rsync_cmd},
+			     @{$config->{rsync_opts}},
+			     map({ ('-f', $_) } @{$config->{rsync_filters}}, @{$backup->{filters} || []}),
+			     ($last_dir ? ('--link-dest', $last_dir) : ()),
+			     $backup->{root},
+			     ($config->{host} ? $config->{host}.':' : '').$current_dir);
+	    my @mv_cmd = (@ssh_cmd, $config->{mv_cmd}, $current_dir, $snapshot_dir);
+	    if ($options{'dry-run'}) {
+		say "rsync command: ".join(' ', @rsync_cmd);
+		say "mv command: ".join(' ', @mv_cmd);
+	    } else {
+		run(\@rsync_cmd, '>&', $log) or die "rsync error: $?";
+		run(\@mv_cmd, '>&', $log) or die "move error: $?";
 
-		run([$config->{mv_cmd}, $current_dir, $snapshot_dir], '>&', $log) or die "move error: $?";
-
-		$last->touch();
+		if ($sftp) {
+		    $sftp->put_content("", $last);
+		} else {
+		    $last->touch();
+		}
 	    }
 
 	    my $end_time = DateTime->now();
@@ -192,6 +252,10 @@ if ($options{backup}) {
 	    say $log "Error: $_";
 	};
 	$log->close;
+	if ($sftp) {
+	    $sftp->put($tmp_log_file, $log_file);
+	    $tmp_log_file->remove;
+	}
     }
     $lock_fh->close;
 }
@@ -279,7 +343,7 @@ if ($options{expire}) {
 		notify("Removing '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
 		try {
 		    my $start_time = DateTime->now();
-		    run([$config->{rm_cmd}, '-r', '-f', $_->{dir}]) or die "remove error: $?";
+		    run([@ssh_cmd, $config->{rm_cmd}, '-r', '-f', $_->{dir}]) or die "remove error: $?";
 		    my $end_time = DateTime->now();
 		    my $elapsed = DateTime::Format::Duration->new(pattern => '%Hh%Mm%Ss')
 			->format_duration(($end_time - $start_time)->clock_duration);
@@ -306,11 +370,20 @@ sub lock_file {
 sub load_snapshots {
     my ($backup_dir) = @_;
     my @snapshots;
-    while (my $file = $backup_dir->next) {
-	next unless($file->is_dir);
-	my $date = $snapshot_name_parser->parse_datetime($file);
-	next unless($date);
-	push(@snapshots, {date => $date, dir => $file});
+    if ($sftp) {
+	foreach my $entry (@{$sftp->ls($backup_dir)}) {
+	    next unless (S_ISDIR($entry->{a}->perm));
+	    my $date = $snapshot_name_parser->parse_datetime($entry->{filename});
+	    next unless($date);
+	    push(@snapshots, {date => $date, dir => $entry->{filename}});
+	}
+    } else {
+	while (my $file = $backup_dir->next) {
+	    next unless($file->is_dir);
+	    my $date = $snapshot_name_parser->parse_datetime($file);
+	    next unless($date);
+	    push(@snapshots, {date => $date, dir => $file});
+	}
     }
     @snapshots = sort { $a->{date} cmp $b->{date} } @snapshots;
     return \@snapshots;
