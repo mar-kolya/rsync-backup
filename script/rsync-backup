@@ -232,7 +232,8 @@ if ($options{backup}) {
 		say "rsync command: ".join(' ', @rsync_cmd);
 		say "mv command: ".join(' ', @mv_cmd);
 	    } else {
-		run(\@rsync_cmd, '>&', $log) or die "rsync error: $?";
+		#Backup should not fail if files vanish during backup, so ignore return code 24
+		run(\@rsync_cmd, '>&', $log) or ($? >> 8 != 24) or die "rsync error: $?";
 		run(\@mv_cmd, '>&', $log) or die "move error: $?";
 
 		if ($sftp) {
