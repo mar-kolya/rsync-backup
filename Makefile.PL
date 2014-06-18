@@ -5,6 +5,7 @@ all_from 'lib/Filesys/Rsync/Backup.pm';
 author   q{Nikolay Martynov <kolya@cpan.org>};
 license  'perl';
 
+requires 'List::Util' => 1.38;
 requires 'DateTime';
 requires 'DateTime::Duration';
 requires 'DateTime::Format::Duration';
@@ -18,6 +19,9 @@ requires 'Config::YAML';
 requires 'Getopt::Long';
 requires 'Pod::Usage';
 requires 'Net::SFTP::Foreign';
+
+requires_external_bin 'rsync';
+requires_external_bin 'ssh';
 
 install_script 'rsync-backup';
 
