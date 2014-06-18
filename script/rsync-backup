@@ -370,7 +370,7 @@ sub load_snapshots {
 	    next unless (S_ISDIR($entry->{a}->perm));
 	    my $date = $snapshot_name_parser->parse_datetime($entry->{filename});
 	    next unless($date);
-	    push(@snapshots, {date => $date, dir => $entry->{filename}});
+	    push(@snapshots, {date => $date, dir => file($backup_dir, $entry->{filename})});
 	}
     } else {
 	while (my $file = $backup_dir->next) {
