@@ -95,6 +95,7 @@ my @interval_formats = (
     DateTime::Format::Duration->new(pattern => '%M minutes'),
     DateTime::Format::Duration->new(pattern => '%M minute')
    );
+my $grace_interval = DateTime::Duration->new(minutes => 5);
 
 my $sftp;
 my @ssh_cmd;
@@ -181,20 +182,10 @@ if ($options{backup}) {
 	    $interval = DateTime::Duration->new(days => 1);
 	    say "Cannot parse backup interval, using default: 1 day";
 	}
+	$interval -= $grace_interval;
 
-	my $too_old;
-	if ($sftp) {
-	    my $stat = $sftp->stat($last);
-	    unless ($stat && $stat->mtime() > ($now - $interval)->epoch()) {
-		$too_old = 1;
-	    }
-	} else {
-	    if(-e $last && stat($last)->mtime() > ($now - $interval)->epoch()) {
-		$too_old = 1;
-	    }
-	}
-
-	unless ($too_old) {
+	my $stat = $sftp ? $sftp->stat($last) : (-e $last && stat($last));
+	if ($stat && $stat->mtime() > ($now - $interval)->epoch()) {
 	    if($options{force}) {
 		say "Backup is recent but we are forced to backup anyway";
 	    } else {
@@ -239,8 +230,10 @@ if ($options{backup}) {
 
 		if ($sftp) {
 		    $sftp->put_content("", $last);
+		    $sftp->utime($last, $now->epoch, $now->epoch);
 		} else {
 		    $last->touch();
+		    utime($now->epoch, $now->epoch, $last);
 		}
 	    }
 
