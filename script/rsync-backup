@@ -50,7 +50,7 @@ my $config = Config::YAML->new(
     mv_cmd => '/bin/mv',
     rm_cmd => '/bin/rm',
     rsync_cmd => '/usr/bin/rsync',
-    rsync_opts => [qw(-a -H -A -X -x --delete --delete-excluded -v --human-readable)],
+    rsync_opts => [qw(-a -H -A -S -X -x --delete --delete-excluded -v --human-readable)],
     rsync_fake_super => 'auto',
     rsync_filters => [
 	'- /**/lost+found',
