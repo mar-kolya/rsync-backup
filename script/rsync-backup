@@ -213,6 +213,10 @@ if ($options{backup}) {
 
 	    die "Backup root not specified" unless($backup->{root});
 
+	    if($backup->{check}) {
+		run(['bash', '-c', $backup->{check}], '>&', $log) || die "pre backup check failed: $?, skipping backup";
+	    }
+
 	    my @rsync_cmd = ($config->{rsync_cmd},
 			     @{$config->{rsync_opts}},
 			     map({ ('-f', $_) } @{$config->{rsync_filters}}, @{$backup->{filters} || []}),

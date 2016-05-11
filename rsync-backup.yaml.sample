@@ -27,6 +27,7 @@ backups:
   home:
     backup_dir: 'home'
     root: '/home/'
+    check: 'grep -qs "/home" /proc/mounts'
     age: '1h'
     filters:
       - '- /*/.gvfs'
