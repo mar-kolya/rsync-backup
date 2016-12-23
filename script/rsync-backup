@@ -97,6 +97,8 @@ my @interval_formats = (
    );
 my $grace_interval = DateTime::Duration->new(minutes => 5);
 
+my $expired_suffix = '.expired';
+
 my $sftp;
 my @ssh_cmd;
 if ($config->{host}) {
@@ -332,12 +334,30 @@ if ($options{expire}) {
 	}
 
 	if ($options{'dry-run'}) {
-	    say "Snapshots to remove for '$backup_name':";
+	    say "Snapshots to expire for '$backup_name':";
 	    foreach (@$snapshots) {
 		say "  $_->{dir}" unless $_->{save};
 	    }
 	} else {
 	    foreach (@$snapshots) {
+		next if $_->{save};
+		notify("Expiring '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
+		try {
+		    run([@ssh_cmd, $config->{mv_cmd}, $_->{dir}, $_->{dir}.$expired_suffix]) or die "remove error: $?";
+		} catch {
+		    notify("Error '$backup_name': $_", 'error');
+		}
+	    }
+	}
+
+	my $expired_snapshots = load_snapshots($backup_dir, $expired_suffix);
+	if ($options{'dry-run'}) {
+	    say "Snapshots to remove for '$backup_name':";
+	    foreach (@$expired_snapshots) {
+		say "  $_->{dir}" unless $_->{save};
+	    }
+	} else {
+	    foreach (@$expired_snapshots) {
 		next if $_->{save};
 		notify("Removing '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
 		try {
@@ -367,19 +387,24 @@ sub lock_file {
 }
 
 sub load_snapshots {
-    my ($backup_dir) = @_;
+    my ($backup_dir, $suffix) = @_;
+    $suffix //= '';
     my @snapshots;
     if ($sftp) {
 	foreach my $entry (@{$sftp->ls($backup_dir)}) {
 	    next unless (S_ISDIR($entry->{a}->perm));
-	    my $date = $snapshot_name_parser->parse_datetime($entry->{filename});
+	    my $name = $entry->{filename};
+	    next unless ($name =~ s/\Q$suffix\E$//);
+	    my $date = $snapshot_name_parser->parse_datetime($name);
 	    next unless($date);
 	    push(@snapshots, {date => $date, dir => file($backup_dir, $entry->{filename})});
 	}
     } else {
 	while (my $file = $backup_dir->next) {
-	    next unless($file->is_dir);
-	    my $date = $snapshot_name_parser->parse_datetime($file);
+	    next unless ($file->is_dir);
+	    my $name = ''.$file;
+	    next unless ($name =~ s/\Q$suffix\E$//);
+	    my $date = $snapshot_name_parser->parse_datetime($name);
 	    next unless($date);
 	    push(@snapshots, {date => $date, dir => $file});
 	}
