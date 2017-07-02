@@ -425,10 +425,11 @@ sub notify {
 	    my %seen;
 	    while($_[0] =~ /^(\w+)\s+.*?(?:\(\:(\d+)(?:\.\d+)?\))$/mg) {
 		my ($user, $display) = ($1, $2);
+		my $uid = getpwnam($user);
 		next if($seen{$user}->{$display});
 		$seen{$user}->{$display} = 1;
 		run(['sudo', '-u', $user, 'bash', '-c',
-		     qq{DISPLAY=:$display notify-send -i "$level" "$header" "$message"}]);
+		     qq{XDG_RUNTIME_DIR=/run/user/$uid DISPLAY=:$display notify-send -i "$level" "$header" "$message"}]);
 	    }
 	});
 }
