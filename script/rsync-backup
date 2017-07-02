@@ -49,6 +49,7 @@ my $config = Config::YAML->new(
     ssh_opts => [qw()],
     mv_cmd => '/bin/mv',
     rm_cmd => '/bin/rm',
+    btrfs_cmd => '/bin/btrfs',
     rsync_cmd => '/usr/bin/rsync',
     rsync_opts => [qw(-a -H -A -S -X -x --delete --delete-excluded -v --human-readable)],
     rsync_fake_super => 'auto',
@@ -219,13 +220,29 @@ if ($options{backup}) {
 		run(['bash', '-c', $backup->{check}], '>&', $log) || die "pre backup check failed: $?, skipping backup";
 	    }
 
+	    if ($config->{subvolumes}) {
+		if (!($sftp ? $sftp->test_e($current_dir) : -e $current_dir)) {
+		    my @cmd = (@ssh_cmd, $config->{btrfs_cmd}, 'subvolume', 'create', $current_dir);
+		    if ($options{'dry-run'}) {
+			say "create subvolume command: ".join(' ', @cmd);
+		    } else {
+			run(\@cmd, '>&', $log) or die "cannot create subvolume: $?";
+		    }
+		}
+	    }
+
 	    my @rsync_cmd = ($config->{rsync_cmd},
 			     @{$config->{rsync_opts}},
 			     map({ ('-f', $_) } @{$config->{rsync_filters}}, @{$backup->{filters} || []}),
-			     ($last_dir ? ('--link-dest', $last_dir) : ()),
-			     $backup->{root},
+			     ($last_dir && !$config->{subvolumes} ? ('--link-dest', $last_dir) : ()),
+			     $backup->{root}.'/',
 			     ($config->{host} ? $config->{host}.':' : '').$current_dir);
-	    my @mv_cmd = (@ssh_cmd, $config->{mv_cmd}, $current_dir, $snapshot_dir);
+	    my @mv_cmd;
+	    if ($config->{subvolumes}) {
+		@mv_cmd = (@ssh_cmd, $config->{btrfs_cmd}, 'subvolume', 'snapshot', '-r', $current_dir, $snapshot_dir);
+	    } else {
+		@mv_cmd = (@ssh_cmd, $config->{mv_cmd}, $current_dir, $snapshot_dir);
+	    };
 	    if ($options{'dry-run'}) {
 		say "rsync command: ".join(' ', @rsync_cmd);
 		say "mv command: ".join(' ', @mv_cmd);
@@ -342,34 +359,42 @@ if ($options{expire}) {
 	    foreach (@$snapshots) {
 		next if $_->{save};
 		notify("Expiring '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
+		my @cmd;
+		if ($config->{subvolumes}) {
+		    @cmd = [@ssh_cmd, $config->{btrfs_cmd}, 'subvolume', 'delete', $_->{dir}];
+		} else {
+		    @cmd = [@ssh_cmd, $config->{mv_cmd}, $_->{dir}, $_->{dir}.$expired_suffix];
+		}
 		try {
-		    run([@ssh_cmd, $config->{mv_cmd}, $_->{dir}, $_->{dir}.$expired_suffix]) or die "remove error: $?";
+		    run(@cmd) or die "remove error: $?";
 		} catch {
 		    notify("Error '$backup_name': $_", 'error');
 		}
 	    }
 	}
 
-	my $expired_snapshots = load_snapshots($backup_dir, $expired_suffix);
-	if ($options{'dry-run'}) {
-	    say "Snapshots to remove for '$backup_name':";
-	    foreach (@$expired_snapshots) {
-		say "  $_->{dir}" unless $_->{save};
-	    }
-	} else {
-	    foreach (@$expired_snapshots) {
-		next if $_->{save};
-		notify("Removing '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
-		try {
-		    my $start_time = DateTime->now();
-		    run([@ssh_cmd, $config->{rm_cmd}, '-r', '-f', $_->{dir}]) or die "remove error: $?";
-		    my $end_time = DateTime->now();
-		    my $elapsed = DateTime::Format::Duration->new(pattern => '%Hh%Mm%Ss')
-			->format_duration(($end_time - $start_time)->clock_duration);
-		    notify("Done removing '$backup_name/"
-			   .$_->{date}->strftime($snapshot_name_format)."', took: ".$elapsed);
-		} catch {
-		    notify("Error '$backup_name': $_", 'error');
+	if (!$config->{subvolumes}) { 
+	    my $expired_snapshots = load_snapshots($backup_dir, $expired_suffix);
+	    if ($options{'dry-run'}) {
+		say "Snapshots to remove for '$backup_name':";
+		foreach (@$expired_snapshots) {
+		    say "  $_->{dir}" unless $_->{save};
+		}
+	    } else {
+		foreach (@$expired_snapshots) {
+		    next if $_->{save};
+		    notify("Removing '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
+		    try {
+			my $start_time = DateTime->now();
+			run([@ssh_cmd, $config->{rm_cmd}, '-r', '-f', $_->{dir}]) or die "remove error: $?";
+			my $end_time = DateTime->now();
+			my $elapsed = DateTime::Format::Duration->new(pattern => '%Hh%Mm%Ss')
+			    ->format_duration(($end_time - $start_time)->clock_duration);
+			notify("Done removing '$backup_name/"
+			       .$_->{date}->strftime($snapshot_name_format)."', took: ".$elapsed);
+		    } catch {
+			notify("Error '$backup_name': $_", 'error');
+		    }
 		}
 	    }
 	}

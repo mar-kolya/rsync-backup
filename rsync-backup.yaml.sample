@@ -1,4 +1,5 @@
 root: '/mnt/backup/'
+snapshots: 1
 backups:
   root:
     backup_dir: 'root'
