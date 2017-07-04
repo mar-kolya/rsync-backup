@@ -359,14 +359,17 @@ if ($options{expire}) {
 	    foreach (@$snapshots) {
 		next if $_->{save};
 		notify("Expiring '$backup_name/".$_->{date}->strftime($snapshot_name_format)."'");
-		my @cmd;
-		if ($config->{subvolumes}) {
-		    @cmd = [@ssh_cmd, $config->{btrfs_cmd}, 'subvolume', 'delete', $_->{dir}];
-		} else {
-		    @cmd = [@ssh_cmd, $config->{mv_cmd}, $_->{dir}, $_->{dir}.$expired_suffix];
-		}
 		try {
-		    run(@cmd) or die "remove error: $?";
+		    if ($config->{subvolumes}) {
+			#apparently owner cannot delete readonly subvolumes, we have to make them writable first
+			my @make_writable_cmd = [@ssh_cmd, $config->{btrfs_cmd}, 'property', 'set', '-ts', $_->{dir}, 'ro', 'false'];
+			run(@make_writable_cmd) or die "make writable error: $?";
+			my @remove_cmd = [@ssh_cmd, $config->{btrfs_cmd}, 'subvolume', 'delete', $_->{dir}];
+			run(@remove_cmd) or die "remove error: $?";
+		    } else {
+			my @cmd = [@ssh_cmd, $config->{mv_cmd}, $_->{dir}, $_->{dir}.$expired_suffix];
+			run(@cmd) or die "remove error: $?";
+		    }
 		} catch {
 		    notify("Error '$backup_name': $_", 'error');
 		}
